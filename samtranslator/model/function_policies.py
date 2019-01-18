@@ -1,9 +1,12 @@
 from enum import Enum
 from collections import namedtuple
 
+from six import string_types
+
 from samtranslator.model.intrinsics import is_instrinsic
 
 PolicyEntry = namedtuple("PolicyEntry", "data type")
+
 
 class FunctionPolicies(object):
     """
@@ -85,7 +88,7 @@ class FunctionPolicies(object):
         result = []
         for policy in policies:
             policy_type = self._get_type(policy)
-            entry = PolicyEntry(data = policy, type = policy_type)
+            entry = PolicyEntry(data=policy, type=policy_type)
             result.append(entry)
 
         return result
@@ -98,8 +101,8 @@ class FunctionPolicies(object):
         :return: True if we can process this resource. False, otherwise
         """
         return resource_properties is not None \
-               and isinstance(resource_properties, dict) \
-               and self.POLICIES_PROPERTY_NAME in resource_properties
+            and isinstance(resource_properties, dict) \
+            and self.POLICIES_PROPERTY_NAME in resource_properties
 
     def _get_type(self, policy):
         """
@@ -112,7 +115,7 @@ class FunctionPolicies(object):
         # Must handle intrinsic functions. Policy could be a primitive type or an intrinsic function
 
         # Managed policies are either string or an intrinsic function that resolves to a string
-        if isinstance(policy, basestring) or is_instrinsic(policy):
+        if isinstance(policy, string_types) or is_instrinsic(policy):
             return PolicyTypes.MANAGED_POLICY
 
         # Policy statement is a dictionary with the key "Statement" in it
@@ -136,10 +139,9 @@ class FunctionPolicies(object):
         """
 
         return self._policy_template_processor is not None and \
-                isinstance(policy, dict) and \
-                len(policy) == 1 and \
-                self._policy_template_processor.has(policy.keys()[0]) is True
-
+            isinstance(policy, dict) and \
+            len(policy) == 1 and \
+            self._policy_template_processor.has(list(policy.keys())[0]) is True
 
 
 class PolicyTypes(Enum):

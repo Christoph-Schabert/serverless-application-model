@@ -1,4 +1,5 @@
 import copy
+from six import string_types
 
 from samtranslator.model.intrinsics import ref
 
@@ -29,6 +30,7 @@ class SwaggerEditor(object):
 
         self._doc = copy.deepcopy(doc)
         self.paths = self._doc["paths"]
+        self.security_definitions = self._doc.get("securityDefinitions", {})
 
     def has_path(self, path, method=None):
         """
@@ -100,7 +102,7 @@ class SwaggerEditor(object):
                 'type': 'aws_proxy',
                 'httpMethod': 'POST',
                 'uri': integration_uri
-            }
+        }
 
         # If 'responses' key is *not* present, add it with an empty dict as value
         self.paths[path][method].setdefault('responses', {})
@@ -116,7 +118,8 @@ class SwaggerEditor(object):
         for path, value in self.paths.items():
             yield path
 
-    def add_cors(self, path, allowed_origins, allowed_headers=None, allowed_methods=None, max_age=None):
+    def add_cors(self, path, allowed_origins, allowed_headers=None, allowed_methods=None, max_age=None,
+                 allow_credentials=None):
         """
         Add CORS configuration to this path. Specifically, we will add a OPTIONS response config to the Swagger that
         will return headers required for CORS. Since SAM uses aws_proxy integration, we cannot inject the headers
@@ -137,6 +140,7 @@ class SwaggerEditor(object):
             Value can also be an intrinsic function dict.
         :param integer/dict max_age: Maximum duration to cache the CORS Preflight request. Value is set on
             Access-Control-Max-Age header. Value can also be an intrinsic function dict.
+        :param bool/None allow_credentials: Flags whether request is allowed to contain credentials.
         :raises ValueError: When values for one of the allowed_* variables is empty
         """
 
@@ -154,15 +158,19 @@ class SwaggerEditor(object):
             # APIGW expects the value to be a "string expression". Hence wrap in another quote. Ex: "'GET,POST,DELETE'"
             allowed_methods = "'{}'".format(allowed_methods)
 
+        if allow_credentials is not True:
+            allow_credentials = False
+
         # Add the Options method and the CORS response
         self.add_path(path, self._OPTIONS_METHOD)
         self.paths[path][self._OPTIONS_METHOD] = self._options_method_response_for_cors(allowed_origins,
                                                                                         allowed_headers,
                                                                                         allowed_methods,
-                                                                                        max_age)
+                                                                                        max_age,
+                                                                                        allow_credentials)
 
     def _options_method_response_for_cors(self, allowed_origins, allowed_headers=None, allowed_methods=None,
-                                          max_age=None):
+                                          max_age=None, allow_credentials=None):
         """
         Returns a Swagger snippet containing configuration for OPTIONS HTTP Method to configure CORS.
 
@@ -177,6 +185,7 @@ class SwaggerEditor(object):
             Value can also be an intrinsic function dict.
         :param integer/dict max_age: Maximum duration to cache the CORS Preflight request. Value is set on
             Access-Control-Max-Age header. Value can also be an intrinsic function dict.
+        :param bool allow_credentials: Flags whether request is allowed to contain credentials.
 
         :return dict: Dictionary containing Options method configuration for CORS
         """
@@ -185,7 +194,8 @@ class SwaggerEditor(object):
         ALLOW_HEADERS = "Access-Control-Allow-Headers"
         ALLOW_METHODS = "Access-Control-Allow-Methods"
         MAX_AGE = "Access-Control-Max-Age"
-        HEADER_RESPONSE = lambda x: "method.response.header."+x
+        ALLOW_CREDENTIALS = "Access-Control-Allow-Credentials"
+        HEADER_RESPONSE = (lambda x: "method.response.header." + x)
 
         response_parameters = {
             # AllowedOrigin is always required
@@ -215,6 +225,11 @@ class SwaggerEditor(object):
             # MaxAge can be set to 0, which is a valid value. So explicitly check against None
             response_parameters[HEADER_RESPONSE(MAX_AGE)] = max_age
             response_headers[MAX_AGE] = {"type": "integer"}
+        if allow_credentials is True:
+            # Allow-Credentials only has a valid value of true, it should be omitted otherwise.
+            # https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Access-Control-Allow-Credentials
+            response_parameters[HEADER_RESPONSE(ALLOW_CREDENTIALS)] = "'true'"
+            response_headers[ALLOW_CREDENTIALS] = {"type": "string"}
 
         return {
             "summary": "CORS support",
@@ -261,14 +276,14 @@ class SwaggerEditor(object):
             return ""
 
         # At this point, value of Swagger path should be a dictionary with method names being the keys
-        methods = self.paths[path].keys()
+        methods = list(self.paths[path].keys())
 
         if self._X_ANY_METHOD in methods:
             # API Gateway's ANY method is not a real HTTP method but a wildcard representing all HTTP methods
             allow_methods = all_http_methods
         else:
             allow_methods = methods
-            allow_methods.append("options") # Always add Options to the CORS methods response
+            allow_methods.append("options")  # Always add Options to the CORS methods response
 
         # Clean up the result:
         #
@@ -284,6 +299,111 @@ class SwaggerEditor(object):
         # Allow-Methods is comma separated string
         return ','.join(allow_methods)
 
+    def add_authorizers(self, authorizers):
+        """
+        Add Authorizer definitions to the securityDefinitions part of Swagger.
+
+        :param list authorizers: List of Authorizer configurations which get translated to securityDefinitions.
+        """
+        self.security_definitions = self.security_definitions or {}
+
+        for authorizerName, authorizer in authorizers.items():
+            self.security_definitions[authorizerName] = authorizer.generate_swagger()
+
+    def set_path_default_authorizer(self, path, default_authorizer, authorizers):
+        """
+        Sets the DefaultAuthorizer for each method on this path. The DefaultAuthorizer won't be set if an Authorizer
+        was defined at the Function/Path/Method level
+
+        :param string path: Path name
+        :param string default_authorizer: Name of the authorizer to use as the default. Must be a key in the
+            authorizers param.
+        :param list authorizers: List of Authorizer configurations defined on the related Api.
+        """
+        for method_name, method in self.paths[path].items():
+            self.set_method_authorizer(path, method_name, default_authorizer, authorizers,
+                                       default_authorizer=default_authorizer, is_default=True)
+
+    def add_auth_to_method(self, path, method_name, auth, api):
+        """
+        Adds auth settings for this path/method. Auth settings currently consist solely of Authorizers
+        but this method will eventually include setting other auth settings such as API Key,
+        Resource Policy, etc.
+
+        :param string path: Path name
+        :param string method_name: Method name
+        :param dict auth: Auth configuration such as Authorizers, ApiKey, ResourcePolicy (only Authorizers supported
+                          currently)
+        :param dict api: Reference to the related Api's properties as defined in the template.
+        """
+        method_authorizer = auth and auth.get('Authorizer')
+        if method_authorizer:
+            api_auth = api.get('Auth')
+            api_authorizers = api_auth and api_auth.get('Authorizers')
+            default_authorizer = api_auth and api_auth.get('DefaultAuthorizer')
+
+            self.set_method_authorizer(path, method_name, method_authorizer, api_authorizers, default_authorizer)
+
+    def set_method_authorizer(self, path, method_name, authorizer_name, authorizers, default_authorizer,
+                              is_default=False):
+        normalized_method_name = self._normalize_method_name(method_name)
+        existing_security = self.paths[path][normalized_method_name].get('security', [])
+        # TEST: [{'sigv4': []}, {'api_key': []}])
+        authorizer_names = set(authorizers.keys())
+        existing_non_authorizer_security = []
+        existing_authorizer_security = []
+
+        # Split existing security into Authorizers and everything else
+        # (e.g. sigv4 (AWS_IAM), api_key (API Key/Usage Plans), NONE (marker for ignoring default))
+        # We want to ensure only a single Authorizer security entry exists while keeping everything else
+        for security in existing_security:
+            if authorizer_names.isdisjoint(security.keys()):
+                existing_non_authorizer_security.append(security)
+            else:
+                existing_authorizer_security.append(security)
+
+        none_idx = -1
+        authorizer_security = []
+
+        # If this is the Api-level DefaultAuthorizer we need to check for an
+        # existing Authorizer before applying the default. It would be simpler
+        # if instead we applied the DefaultAuthorizer first and then simply
+        # overwrote it if necessary, however, the order in which things get
+        # applied (Function Api Events first; then Api Resource) complicates it.
+        if is_default:
+            # Check if Function/Path/Method specified 'NONE' for Authorizer
+            for idx, security in enumerate(existing_non_authorizer_security):
+                is_none = any(key == 'NONE' for key in security.keys())
+
+                if is_none:
+                    none_idx = idx
+                    break
+
+            # NONE was found; remove it and don't add the DefaultAuthorizer
+            if none_idx > -1:
+                del existing_non_authorizer_security[none_idx]
+
+            # Existing Authorizer found (defined at Function/Path/Method); use that instead of default
+            elif existing_authorizer_security:
+                authorizer_security = existing_authorizer_security
+
+            # No existing Authorizer found; use default
+            else:
+                security_dict = {}
+                security_dict[authorizer_name] = []
+                authorizer_security = [security_dict]
+
+        # This is a Function/Path/Method level Authorizer; simply set it
+        else:
+            security_dict = {}
+            security_dict[authorizer_name] = []
+            authorizer_security = [security_dict]
+
+        security = existing_non_authorizer_security + authorizer_security
+
+        if security:
+            self.paths[path][normalized_method_name]['security'] = security
+
     @property
     def swagger(self):
         """
@@ -294,6 +414,10 @@ class SwaggerEditor(object):
 
         # Make sure any changes to the paths are reflected back in output
         self._doc["paths"] = self.paths
+
+        if self.security_definitions:
+            self._doc["securityDefinitions"] = self.security_definitions
+
         return copy.deepcopy(self._doc)
 
     @staticmethod
@@ -305,9 +429,9 @@ class SwaggerEditor(object):
         :return: True, if data is a Swagger
         """
         return bool(data) and \
-                isinstance(data, dict) and \
-                bool(data.get("swagger")) and \
-                isinstance(data.get('paths'), dict)
+            isinstance(data, dict) and \
+            bool(data.get("swagger")) and \
+            isinstance(data.get('paths'), dict)
 
     @staticmethod
     def gen_skeleton():
@@ -337,7 +461,7 @@ class SwaggerEditor(object):
         :param string method: Name of the HTTP Method
         :return string: Normalized method name
         """
-        if not method or not isinstance(method, basestring):
+        if not method or not isinstance(method, string_types):
             return method
 
         method = method.lower()

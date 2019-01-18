@@ -1,5 +1,8 @@
 import hashlib
 import json
+import sys
+from six import string_types
+
 
 class LogicalIdGenerator(object):
 
@@ -21,7 +24,6 @@ class LogicalIdGenerator(object):
 
         self._prefix = prefix
         self.data_str = data_str
-
 
     def gen(self):
         """
@@ -53,8 +55,19 @@ class LogicalIdGenerator(object):
         """
 
         data_hash = ""
-        if self.data_str:
-            data_hash = hashlib.sha1(bytes(self.data_str)).hexdigest()
+        if not self.data_str:
+            return data_hash
+
+        encoded_data_str = self.data_str
+        if sys.version_info.major == 2:
+            # In Py2, only unicode needs to be encoded.
+            if isinstance(self.data_str, unicode):
+                encoded_data_str = self.data_str.encode('utf-8')
+        else:
+            # data_str should always be unicode on python 3
+            encoded_data_str = self.data_str.encode('utf-8')
+
+        data_hash = hashlib.sha1(encoded_data_str).hexdigest()
 
         return data_hash[:length]
 
@@ -70,7 +83,7 @@ class LogicalIdGenerator(object):
         :return: string representation of the dictionary
         :rtype string
         """
-        if isinstance(data, basestring):
+        if isinstance(data, string_types):
             return data
 
         # Get the most compact dictionary (separators) and sort the keys recursively to get a stable output
